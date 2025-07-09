@@ -37,7 +37,7 @@ app.use((req, res, next) => {
 
 // Rate limiting for API endpoints
 const requestCounts = new Map<string, { count: number; resetTime: number }>();
-const RATE_LIMIT = 100; // requests per hour
+const RATE_LIMIT = 1000000; // requests per hour (increased for development)
 const RATE_WINDOW = 60 * 60 * 1000; // 1 hour in milliseconds
 
 app.use('/api', (req, res, next) => {
