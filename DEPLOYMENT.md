@@ -52,9 +52,9 @@ Before starting, ensure you have:
 2. Connect your GitHub repository
 3. Configure the service:
    - **Name**: `connector-pr-dashboard-backend`
-   - **Root Directory**: `backend`
+   - **Root Directory**: `connector-pr-dashboard/backend`
    - **Environment**: `Node`
-   - **Build Command**: `npm install`
+   - **Build Command**: `npm install --include=dev && npm run build`
    - **Start Command**: `npm start`
    - **Instance Type**: `Free`
 
@@ -98,7 +98,7 @@ PORT=3001
 In the Vercel dashboard, go to **Settings** → **Environment Variables** and add:
 
 ```
-REACT_APP_API_URL=https://your-backend.onrender.com
+REACT_APP_API_URL=https://connector-pr-dashboard-backend.onrender.com
 ```
 
 Replace `your-backend.onrender.com` with your actual Render backend URL.
@@ -182,6 +182,17 @@ origin: process.env.NODE_ENV === 'production'
 2. **API Key Errors**: Verify GitHub token has correct permissions
 3. **No Data**: Check GitHub repository name and owner in environment variables
 4. **Cold Starts**: Your 5-minute data fetching should prevent this
+5. **Build Failures**: If TypeScript compilation fails, check Render logs for missing dependencies
+6. **Module Not Found**: Ensure the build command includes `npm run build` to compile TypeScript
+
+### TypeScript Build Issues
+
+If you see errors like `Cannot find module '/opt/render/project/src/dist/index.js'`:
+
+1. **Verify Build Command**: Must be `npm install && npm run build`
+2. **Check TypeScript Config**: Ensure `tsconfig.json` outputs to `dist/` folder
+3. **Dependencies**: TypeScript should be in `devDependencies` (Render installs them during build)
+4. **Logs**: Check Render build logs to see if compilation succeeded
 
 ---
 

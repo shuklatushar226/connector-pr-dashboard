@@ -15,7 +15,7 @@ const wss = new WebSocket.Server({ server });
 // Security and middleware configuration
 const corsOptions = {
   origin: process.env.NODE_ENV === 'production' 
-    ? ['https://your-frontend-domain.vercel.app'] // Update with actual frontend URL
+    ? ['https://frontend-plum-eta-85.vercel.app'] // Your actual Vercel frontend URL
     : ['http://localhost:3000', 'http://127.0.0.1:3000'],
   credentials: true,
   optionsSuccessStatus: 200
