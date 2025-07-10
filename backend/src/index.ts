@@ -16,7 +16,7 @@ const wss = new WebSocket.Server({ server });
 const corsOptions = {
   origin: process.env.NODE_ENV === 'production' 
     ? ['https://frontend-plum-eta-85.vercel.app'] // Your actual Vercel frontend URL
-    : ['http://localhost:3000', 'http://127.0.0.1:3000'],
+    : ['http://localhost:3002', 'http://127.0.0.1:3002'],
   credentials: true,
   optionsSuccessStatus: 200
 };
@@ -468,6 +468,114 @@ async function getCachedCodeContext(comment: Comment, prNumber: number): Promise
   return context;
 }
 
+// Background summary generation for improved performance
+async function generateBackgroundSummaries() {
+  console.log('🤖 Starting background summary generation...');
+  
+  // Get PRs that don't have summaries or have been updated since last summary
+  const prsNeedingSummaries = pullRequests.filter(pr => {
+    if (!prSummaries.has(pr.github_pr_number)) {
+      return true; // No summary exists
+    }
+    
+    // Check if PR was updated after summary was generated
+    const summary = prSummaries.get(pr.github_pr_number);
+    const prUpdated = new Date(pr.updated_at);
+    const summaryGenerated = new Date(summary?.metadata.generated_at || 0);
+    
+    return prUpdated > summaryGenerated;
+  });
+  
+  console.log(`📊 Found ${prsNeedingSummaries.length} PRs needing summary generation`);
+  
+  // Generate summaries for PRs that need them (limit to 3 at a time to avoid overwhelming Gemini API)
+  const batchSize = 3;
+  for (let i = 0; i < Math.min(prsNeedingSummaries.length, batchSize); i++) {
+    const pr = prsNeedingSummaries[i];
+    
+    try {
+      console.log(`🔄 Background generating summary for PR #${pr.github_pr_number}: "${pr.title}"`);
+      
+      // Get comments and reviews for this PR
+      const allComments = comments.filter(c => c.pr_id === pr.github_pr_number);
+      const allReviews = reviews.filter(r => r.pr_id === pr.github_pr_number);
+      
+      // Filter out bot comments and reviews
+      const humanComments = allComments.filter(isHumanComment);
+      const humanReviews = allReviews.filter(isHumanReview);
+      
+      // Determine analysis strategy
+      const strategy = determineAnalysisStrategy(allComments, allReviews);
+      
+      let summary;
+      
+      if (strategy.type === 'code_only') {
+        // Generate code-only analysis
+        summary = {
+          summary: {
+            executive: `This PR contains code changes without human discussion. Analysis based on code structure and commit messages.`,
+            technical_feedback: [],
+            rl_insights: {
+              current_approach_analysis: "Code-only analysis: Unable to assess current approach without discussion context.",
+              improvement_opportunities: ["Consider adding more detailed PR description", "Request code review from team members"],
+              risk_assessment: "Medium risk due to lack of peer review discussion.",
+              recommended_experiments: ["Add unit tests", "Consider integration testing"]
+            },
+            action_items: [
+              {
+                description: "Request human code review",
+                priority: "high" as const,
+                estimated_effort: "1-2 hours",
+                blocking: false
+              }
+            ],
+            sentiment_analysis: {
+              overall_tone: "neutral" as const,
+              reviewer_confidence: "low" as const,
+              consensus_level: "weak" as const
+            }
+          },
+          metadata: {
+            generated_at: new Date().toISOString(),
+            model_used: 'code-analysis',
+            token_usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            confidence_score: 0.3,
+            analysis_strategy: strategy,
+            background_generated: true
+          }
+        };
+      } else if (humanComments.length > 0 || humanReviews.length > 0) {
+        // Generate discussion-based summary using Gemini
+        summary = await geminiService.generatePRSummary(pr, humanComments, humanReviews);
+        summary.metadata.analysis_strategy = strategy;
+        summary.metadata.background_generated = true;
+      } else {
+        console.log(`⏭️ Skipping PR #${pr.github_pr_number} - no meaningful content for analysis`);
+        continue;
+      }
+      
+      // Cache the summary
+      prSummaries.set(pr.github_pr_number, summary);
+      
+      // Broadcast update to connected clients
+      broadcastUpdate({ 
+        type: 'summary_generated', 
+        data: { prNumber: pr.github_pr_number, summary } 
+      });
+      
+      console.log(`✅ Background summary generated for PR #${pr.github_pr_number}`);
+      
+      // Small delay to avoid overwhelming the API
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+    } catch (error) {
+      console.error(`❌ Error generating background summary for PR #${pr.github_pr_number}:`, error);
+    }
+  }
+  
+  console.log(`🎉 Background summary generation completed`);
+}
+
 // Fetch PRs from GitHub
 async function fetchConnectorPRs() {
   try {
@@ -589,6 +697,14 @@ async function fetchConnectorPRs() {
 
     console.log(`✨ Successfully processed ${pullRequests.length} connector integration PRs`);
     broadcastUpdate({ type: 'prs_updated', data: pullRequests });
+    
+    // Trigger background summary generation after PR data is updated
+    setTimeout(() => {
+      generateBackgroundSummaries().catch(error => {
+        console.error('❌ Error in background summary generation:', error);
+      });
+    }, 2000); // Small delay to ensure all data is processed
+    
   } catch (error) {
     console.error('❌ Error fetching PRs:', error);
   }
@@ -957,7 +1073,8 @@ app.get('/api/prs/:prNumber/summary/status', (req, res) => {
       exists: true,
       generated_at: summary?.metadata.generated_at,
       confidence_score: summary?.metadata.confidence_score,
-      token_usage: summary?.metadata.token_usage
+      token_usage: summary?.metadata.token_usage,
+      background_generated: summary?.metadata.background_generated || false
     });
   } else {
     res.json({
@@ -965,6 +1082,35 @@ app.get('/api/prs/:prNumber/summary/status', (req, res) => {
       message: 'No summary available for this PR'
     });
   }
+});
+
+// Bulk summary status endpoint for performance
+app.get('/api/summaries/status', (req, res) => {
+  const summaryStatus = pullRequests.map(pr => {
+    const hasSummary = prSummaries.has(pr.github_pr_number);
+    const summary = prSummaries.get(pr.github_pr_number);
+    
+    return {
+      pr_number: pr.github_pr_number,
+      title: pr.title,
+      has_summary: hasSummary,
+      generated_at: summary?.metadata.generated_at || null,
+      background_generated: summary?.metadata.background_generated || false,
+      confidence_score: summary?.metadata.confidence_score || null
+    };
+  });
+  
+  const stats = {
+    total_prs: pullRequests.length,
+    cached_summaries: summaryStatus.filter(s => s.has_summary).length,
+    background_generated: summaryStatus.filter(s => s.background_generated).length,
+    manual_generated: summaryStatus.filter(s => s.has_summary && !s.background_generated).length
+  };
+  
+  res.json({
+    summary_status: summaryStatus,
+    statistics: stats
+  });
 });
 
 // Common Learning Endpoints

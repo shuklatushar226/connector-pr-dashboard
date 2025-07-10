@@ -32,6 +32,7 @@ export interface PRSummary {
       bot_reviews: number;
       confidence_level: 'high' | 'medium' | 'low';
     };
+    background_generated?: boolean;
   };
 }
 
