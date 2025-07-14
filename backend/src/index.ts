@@ -137,7 +137,14 @@ interface PRTimeline {
     first_review_to_comments_fixed: number;
     comments_fixed_to_approved: number;
     approved_to_merged: number;
+    ongoing_time: number; // Time for open PRs from last activity to now
     total_review_time: number;
+  };
+  milestones: {
+    pr_created: { timestamp: string; achieved: boolean; };
+    first_review: { timestamp: string | null; achieved: boolean; };
+    approved: { timestamp: string | null; achieved: boolean; };
+    merged: { timestamp: string | null; achieved: boolean; };
   };
 }
 
@@ -453,57 +460,164 @@ function calculateDaysDiff(startDate: string, endDate: string): number {
   return Math.round((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24) * 10) / 10; // Round to 1 decimal place
 }
 
-// Helper function to calculate PR timeline
+// Enhanced timeline interfaces with validation
+interface PRTimelineValidation {
+  is_valid: boolean;
+  confidence_score: number;
+  issues: string[];
+  data_quality: 'high' | 'medium' | 'low';
+}
+
+interface EnhancedPRTimeline extends PRTimeline {
+  validation: PRTimelineValidation;
+  review_cycles: ReviewCycle[];
+  actual_events: TimelineEvent[];
+}
+
+interface ReviewCycle {
+  cycle_number: number;
+  changes_requested_at: string;
+  changes_addressed_at: string | null;
+  duration_days: number;
+  reviewer: string;
+}
+
+interface TimelineEvent {
+  event_type: 'pr_created' | 'first_review' | 'changes_requested' | 'changes_addressed' | 'approved' | 'merged';
+  timestamp: string;
+  actor: string;
+  details?: string;
+}
+
+// Helper function to calculate PR timeline with improved accuracy
 function calculatePRTimeline(pr: PullRequest, prReviews: Review[], prComments: Comment[]): PRTimeline {
+  // Use the enhanced calculation but return the basic interface for backward compatibility
+  const enhancedTimeline = calculateEnhancedPRTimeline(pr, prReviews, prComments);
+  
+  // Convert to basic timeline format
+  return {
+    pr_number: enhancedTimeline.pr_number,
+    pr_title: enhancedTimeline.pr_title,
+    pr_author: enhancedTimeline.pr_author,
+    total_duration: enhancedTimeline.total_duration,
+    stages: enhancedTimeline.stages,
+    is_completed: enhancedTimeline.is_completed,
+    stage_durations: enhancedTimeline.stage_durations,
+    milestones: enhancedTimeline.milestones
+  };
+}
+
+// Enhanced timeline calculation with proper event-driven logic
+function calculateEnhancedPRTimeline(pr: PullRequest, prReviews: Review[], prComments: Comment[]): EnhancedPRTimeline {
   const stages: PRTimelineStage[] = [];
   const stageDurations = {
     pr_raised_to_first_review: 0,
     first_review_to_comments_fixed: 0,
     comments_fixed_to_approved: 0,
     approved_to_merged: 0,
+    ongoing_time: 0,
     total_review_time: 0
   };
 
-  // Stage 1: PR Raised
-  const prRaisedTime = pr.created_at;
-  stages.push({
-    stage: 'pr_raised',
-    timestamp: prRaisedTime
+  // Create chronological event timeline
+  const events: TimelineEvent[] = [];
+  const issues: string[] = [];
+  let confidenceScore = 1.0;
+
+  // PR Creation Event
+  events.push({
+    event_type: 'pr_created',
+    timestamp: pr.created_at,
+    actor: pr.author
   });
 
-  // Stage 2: First Review Done
+  stages.push({
+    stage: 'pr_raised',
+    timestamp: pr.created_at
+  });
+
+  // Process all reviews chronologically
   const sortedReviews = prReviews.sort((a, b) => new Date(a.submitted_at).getTime() - new Date(b.submitted_at).getTime());
-  const firstReview = sortedReviews[0];
+  const reviewCycles: ReviewCycle[] = [];
   
-  if (firstReview) {
-    const duration = calculateDaysDiff(prRaisedTime, firstReview.submitted_at);
-    stageDurations.pr_raised_to_first_review = duration;
-    
-    stages.push({
-      stage: 'first_review',
-      timestamp: firstReview.submitted_at,
-      duration_from_previous: duration
-    });
+  let firstReviewFound = false;
+  let currentCycle = 0;
+  let lastChangesRequestedTime: string | null = null;
+  let lastApprovalTime: string | null = null;
+
+  for (const review of sortedReviews) {
+    // First review detection
+    if (!firstReviewFound) {
+      firstReviewFound = true;
+      const duration = calculateDaysDiff(pr.created_at, review.submitted_at);
+      stageDurations.pr_raised_to_first_review = duration;
+      
+      events.push({
+        event_type: 'first_review',
+        timestamp: review.submitted_at,
+        actor: review.reviewer_username,
+        details: review.review_state
+      });
+
+      stages.push({
+        stage: 'first_review',
+        timestamp: review.submitted_at,
+        duration_from_previous: duration
+      });
+    }
+
+    // Track review cycles for changes requested
+    if (review.review_state === 'changes_requested') {
+      currentCycle++;
+      lastChangesRequestedTime = review.submitted_at;
+      
+      events.push({
+        event_type: 'changes_requested',
+        timestamp: review.submitted_at,
+        actor: review.reviewer_username
+      });
+
+      // Look for subsequent updates (commits, file changes) that indicate changes were addressed
+      const changesAddressedTime = findChangesAddressedTime(pr, review.submitted_at, sortedReviews);
+      
+      reviewCycles.push({
+        cycle_number: currentCycle,
+        changes_requested_at: review.submitted_at,
+        changes_addressed_at: changesAddressedTime,
+        duration_days: changesAddressedTime ? calculateDaysDiff(review.submitted_at, changesAddressedTime) : 0,
+        reviewer: review.reviewer_username
+      });
+
+      if (changesAddressedTime) {
+        events.push({
+          event_type: 'changes_addressed',
+          timestamp: changesAddressedTime,
+          actor: pr.author
+        });
+      }
+    }
+
+    // Track approvals
+    if (review.review_state === 'approved') {
+      lastApprovalTime = review.submitted_at;
+      
+      events.push({
+        event_type: 'approved',
+        timestamp: review.submitted_at,
+        actor: review.reviewer_username
+      });
+    }
   }
 
-  // Stage 3: Comments Fixed (after changes were requested)
-  const changesRequestedReviews = prReviews.filter(r => r.review_state === 'changes_requested');
-  let commentsFixedTime: string | null = null;
-  
-  if (changesRequestedReviews.length > 0) {
-    // Find the last time changes were requested
-    const lastChangesRequested = changesRequestedReviews.sort((a, b) => 
-      new Date(b.submitted_at).getTime() - new Date(a.submitted_at).getTime()
-    )[0];
-    
-    // Look for subsequent updates after changes were requested
-    const updatesAfterChanges = [pr.updated_at].filter(updateTime => 
-      new Date(updateTime) > new Date(lastChangesRequested.submitted_at)
-    );
-    
-    if (updatesAfterChanges.length > 0) {
-      commentsFixedTime = updatesAfterChanges[0];
-      const duration = firstReview ? calculateDaysDiff(firstReview.submitted_at, commentsFixedTime) : 0;
+  // Calculate stage durations more accurately
+  if (lastChangesRequestedTime && reviewCycles.length > 0) {
+    // Use the last cycle's completion time for "comments fixed"
+    const lastCycle = reviewCycles[reviewCycles.length - 1];
+    if (lastCycle.changes_addressed_at) {
+      const commentsFixedTime = lastCycle.changes_addressed_at;
+      const baseTime = stages.find(s => s.stage === 'first_review')?.timestamp || pr.created_at;
+      const duration = calculateDaysDiff(baseTime, commentsFixedTime);
+      
       stageDurations.first_review_to_comments_fixed = duration;
       
       stages.push({
@@ -511,34 +625,49 @@ function calculatePRTimeline(pr: PullRequest, prReviews: Review[], prComments: C
         timestamp: commentsFixedTime,
         duration_from_previous: duration
       });
+    } else {
+      issues.push('Changes were requested but no clear resolution detected');
+      confidenceScore -= 0.2;
     }
   }
 
-  // Stage 4: Approved (when PR reached required approvals)
-  const approvedReviews = prReviews.filter(r => r.review_state === 'approved');
-  if (approvedReviews.length >= 1) { // Assuming 1 approval needed, adjust as needed
-    const lastApproval = approvedReviews.sort((a, b) => 
-      new Date(b.submitted_at).getTime() - new Date(a.submitted_at).getTime()
-    )[0];
+  // Approval stage
+  if (lastApprovalTime) {
+    const commentsFixedStage = stages.find(s => s.stage === 'comments_fixed');
+    const baseTime = commentsFixedStage?.timestamp || 
+                    stages.find(s => s.stage === 'first_review')?.timestamp || 
+                    pr.created_at;
     
-    const baseTime = commentsFixedTime || (firstReview ? firstReview.submitted_at : prRaisedTime);
-    const duration = calculateDaysDiff(baseTime, lastApproval.submitted_at);
+    const duration = calculateDaysDiff(baseTime, lastApprovalTime);
     stageDurations.comments_fixed_to_approved = duration;
     
-    stages.push({
-      stage: 'approved',
-      timestamp: lastApproval.submitted_at,
-      duration_from_previous: duration
-    });
+    // Only add approved stage if it doesn't already exist
+    if (!stages.find(s => s.stage === 'approved')) {
+      stages.push({
+        stage: 'approved',
+        timestamp: lastApprovalTime,
+        duration_from_previous: duration
+      });
+    }
   }
 
-  // Stage 5: Merged
+  // Merge stage
   if (pr.merged_at) {
-    const approvedTime = stages.find(s => s.stage === 'approved')?.timestamp;
-    const baseTime = approvedTime || (commentsFixedTime || (firstReview ? firstReview.submitted_at : prRaisedTime));
+    const approvedStage = stages.find(s => s.stage === 'approved');
+    const baseTime = approvedStage?.timestamp || 
+                    stages.find(s => s.stage === 'comments_fixed')?.timestamp ||
+                    stages.find(s => s.stage === 'first_review')?.timestamp || 
+                    pr.created_at;
+    
     const duration = calculateDaysDiff(baseTime, pr.merged_at);
     stageDurations.approved_to_merged = duration;
     
+    events.push({
+      event_type: 'merged',
+      timestamp: pr.merged_at,
+      actor: 'system'
+    });
+
     stages.push({
       stage: 'merged',
       timestamp: pr.merged_at,
@@ -546,12 +675,36 @@ function calculatePRTimeline(pr: PullRequest, prReviews: Review[], prComments: C
     });
   }
 
-  // Calculate total duration
-  const totalDuration = pr.merged_at ? 
-    calculateDaysDiff(prRaisedTime, pr.merged_at) : 
-    calculateDaysDiff(prRaisedTime, new Date().toISOString());
-
+  // Calculate total duration and ongoing time for open PRs
+  const endTime = pr.merged_at || new Date().toISOString();
+  const totalDuration = calculateDaysDiff(pr.created_at, endTime);
   stageDurations.total_review_time = totalDuration;
+
+  // Calculate ongoing time for open PRs
+  if (!pr.merged_at) {
+    const lastActivityTime = stages.length > 1 ? stages[stages.length - 1].timestamp : pr.created_at;
+    stageDurations.ongoing_time = calculateDaysDiff(lastActivityTime, new Date().toISOString());
+  }
+
+  // Create milestones object
+  const milestones = {
+    pr_created: { timestamp: pr.created_at, achieved: true },
+    first_review: { 
+      timestamp: stages.find(s => s.stage === 'first_review')?.timestamp || null, 
+      achieved: !!stages.find(s => s.stage === 'first_review') 
+    },
+    approved: { 
+      timestamp: lastApprovalTime, 
+      achieved: !!lastApprovalTime 
+    },
+    merged: { 
+      timestamp: pr.merged_at, 
+      achieved: pr.status === 'merged' 
+    }
+  };
+
+  // Validate timeline logic
+  const validation = validateTimeline(stages, events, reviewCycles, issues, confidenceScore);
 
   return {
     pr_number: pr.github_pr_number,
@@ -560,7 +713,97 @@ function calculatePRTimeline(pr: PullRequest, prReviews: Review[], prComments: C
     total_duration: totalDuration,
     stages,
     is_completed: pr.status === 'merged' || pr.status === 'closed',
-    stage_durations: stageDurations
+    stage_durations: stageDurations,
+    milestones,
+    validation,
+    review_cycles: reviewCycles,
+    actual_events: events
+  };
+}
+
+// Helper function to find when changes were actually addressed
+function findChangesAddressedTime(pr: PullRequest, changesRequestedAt: string, allReviews: Review[]): string | null {
+  const changesRequestedTime = new Date(changesRequestedAt);
+  
+  // Look for subsequent approvals or reviews after changes were requested
+  const subsequentReviews = allReviews.filter(review => {
+    const reviewTime = new Date(review.submitted_at);
+    return reviewTime > changesRequestedTime && 
+           (review.review_state === 'approved' || review.review_state === 'commented');
+  });
+
+  if (subsequentReviews.length > 0) {
+    // Return the timestamp of the first subsequent review
+    return subsequentReviews[0].submitted_at;
+  }
+
+  // Fallback: use PR updated time if it's after changes were requested
+  const prUpdatedTime = new Date(pr.updated_at);
+  if (prUpdatedTime > changesRequestedTime) {
+    return pr.updated_at;
+  }
+
+  return null;
+}
+
+// Timeline validation function
+function validateTimeline(
+  stages: PRTimelineStage[], 
+  events: TimelineEvent[], 
+  reviewCycles: ReviewCycle[], 
+  issues: string[], 
+  confidenceScore: number
+): PRTimelineValidation {
+  const additionalIssues = [...issues];
+  let adjustedConfidence = confidenceScore;
+
+  // Check chronological order
+  for (let i = 1; i < stages.length; i++) {
+    const prevTime = new Date(stages[i-1].timestamp);
+    const currTime = new Date(stages[i].timestamp);
+    
+    if (currTime < prevTime) {
+      additionalIssues.push(`Stage ${stages[i].stage} occurs before ${stages[i-1].stage}`);
+      adjustedConfidence -= 0.3;
+    }
+  }
+
+  // Check for reasonable durations
+  for (const stage of stages) {
+    if (stage.duration_from_previous && stage.duration_from_previous < 0) {
+      additionalIssues.push(`Negative duration detected for stage ${stage.stage}`);
+      adjustedConfidence -= 0.2;
+    }
+    
+    if (stage.duration_from_previous && stage.duration_from_previous > 30) {
+      additionalIssues.push(`Unusually long duration (${stage.duration_from_previous} days) for stage ${stage.stage}`);
+      adjustedConfidence -= 0.1;
+    }
+  }
+
+  // Check review cycle consistency
+  for (const cycle of reviewCycles) {
+    if (cycle.duration_days > 14) {
+      additionalIssues.push(`Review cycle ${cycle.cycle_number} took ${cycle.duration_days} days to address`);
+      adjustedConfidence -= 0.05;
+    }
+  }
+
+  // Determine data quality
+  let dataQuality: 'high' | 'medium' | 'low';
+  if (adjustedConfidence >= 0.8 && additionalIssues.length === 0) {
+    dataQuality = 'high';
+  } else if (adjustedConfidence >= 0.6 && additionalIssues.length <= 2) {
+    dataQuality = 'medium';
+  } else {
+    dataQuality = 'low';
+  }
+
+  return {
+    is_valid: adjustedConfidence >= 0.5 && additionalIssues.length < 5,
+    confidence_score: Math.max(0, Math.min(1, adjustedConfidence)),
+    issues: additionalIssues,
+    data_quality: dataQuality
   };
 }
 
@@ -1178,6 +1421,25 @@ app.get('/api/analytics/timeline', (req, res) => {
       .filter(t => t.stage_durations.comments_fixed_to_approved > 0)
       .reduce((sum, t, _, arr) => sum + t.stage_durations.comments_fixed_to_approved / arr.length, 0);
 
+    // Calculate enhanced timeline data with validation
+    const enhancedTimelineData: EnhancedPRTimeline[] = pullRequests.map(pr => {
+      const prReviews = reviews.filter(r => r.pr_id === pr.github_pr_number);
+      const prComments = comments.filter(c => c.pr_id === pr.github_pr_number);
+      
+      return calculateEnhancedPRTimeline(pr, prReviews, prComments);
+    });
+
+    // Calculate data quality metrics
+    const qualityMetrics = {
+      high_quality: enhancedTimelineData.filter(t => t.validation.data_quality === 'high').length,
+      medium_quality: enhancedTimelineData.filter(t => t.validation.data_quality === 'medium').length,
+      low_quality: enhancedTimelineData.filter(t => t.validation.data_quality === 'low').length,
+      invalid_timelines: enhancedTimelineData.filter(t => !t.validation.is_valid).length,
+      avg_confidence_score: enhancedTimelineData.reduce((sum, t) => sum + t.validation.confidence_score, 0) / enhancedTimelineData.length,
+      total_issues_detected: enhancedTimelineData.reduce((sum, t) => sum + t.validation.issues.length, 0),
+      review_cycles_total: enhancedTimelineData.reduce((sum, t) => sum + t.review_cycles.length, 0)
+    };
+
     const summary = {
       total_prs_analyzed: timelineData.length,
       completed_prs: completedPRs.length,
@@ -1185,14 +1447,17 @@ app.get('/api/analytics/timeline', (req, res) => {
       avg_first_review_time_days: Math.round(avgFirstReviewTime * 10) / 10,
       avg_approval_time_days: Math.round(avgApprovalTime * 10) / 10,
       longest_pr: sortedTimelineData[0] || null,
-      fastest_pr: completedPRs.sort((a, b) => a.total_duration - b.total_duration)[0] || null
+      fastest_pr: completedPRs.sort((a, b) => a.total_duration - b.total_duration)[0] || null,
+      data_quality: qualityMetrics
     };
 
     console.log(`✅ Generated timeline for ${timelineData.length} PRs`);
     console.log(`📈 Summary: Avg total time ${summary.avg_total_time_days}d, First review ${summary.avg_first_review_time_days}d`);
+    console.log(`🔍 Data Quality: ${qualityMetrics.high_quality} high, ${qualityMetrics.medium_quality} medium, ${qualityMetrics.low_quality} low quality timelines`);
 
     res.json({
       timeline_data: sortedTimelineData,
+      enhanced_timeline_data: enhancedTimelineData,
       summary: summary,
       generated_at: new Date().toISOString()
     });
@@ -1794,6 +2059,62 @@ app.get('/api/debug/pr/:prNumber', (req, res) => {
       approved_reviews: prReviews.filter(r => r.review_state === 'approved').length,
       changes_requested: prReviews.filter(r => r.review_state === 'changes_requested').length,
       commented: prReviews.filter(r => r.review_state === 'commented').length
+    }
+  };
+  
+  res.json(debugData);
+});
+
+// Enhanced debug endpoint for timeline validation
+app.get('/api/debug/pr/:prNumber/timeline', (req, res) => {
+  const prNumber = parseInt(req.params.prNumber);
+  const pr = pullRequests.find(p => p.github_pr_number === prNumber);
+  
+  if (!pr) {
+    return res.status(404).json({ error: 'PR not found' });
+  }
+
+  const prReviews = reviews.filter(r => r.pr_id === prNumber);
+  const prComments = comments.filter(c => c.pr_id === prNumber);
+  
+  // Calculate both basic and enhanced timelines
+  const basicTimeline = calculatePRTimeline(pr, prReviews, prComments);
+  const enhancedTimeline = calculateEnhancedPRTimeline(pr, prReviews, prComments);
+  
+  const debugData = {
+    pr_info: {
+      number: pr.github_pr_number,
+      title: pr.title,
+      author: pr.author,
+      created_at: pr.created_at,
+      updated_at: pr.updated_at,
+      merged_at: pr.merged_at,
+      status: pr.status
+    },
+    basic_timeline: basicTimeline,
+    enhanced_timeline: enhancedTimeline,
+    raw_data: {
+      reviews: prReviews.map(r => ({
+        reviewer: r.reviewer_username,
+        state: r.review_state,
+        submitted_at: r.submitted_at,
+        content_length: r.content?.length || 0
+      })),
+      comments: prComments.map(c => ({
+        author: c.author,
+        type: c.comment_type,
+        created_at: c.created_at,
+        content_length: c.content.length,
+        file_path: c.file_path
+      }))
+    },
+    validation_details: {
+      issues_found: enhancedTimeline.validation.issues,
+      confidence_score: enhancedTimeline.validation.confidence_score,
+      data_quality: enhancedTimeline.validation.data_quality,
+      is_valid: enhancedTimeline.validation.is_valid,
+      review_cycles_count: enhancedTimeline.review_cycles.length,
+      events_timeline: enhancedTimeline.actual_events
     }
   };
   
