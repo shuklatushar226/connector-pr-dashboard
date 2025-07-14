@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 import { Octokit } from '@octokit/rest';
 import WebSocket from 'ws';
 import http from 'http';
-import geminiService, { PRSummary, CommonLearning } from './services/geminiService';
+import geminiService, { PRSummary, CommonLearning, CommentCategorizationResponse } from './services/geminiService';
 
 dotenv.config();
 
@@ -16,7 +16,7 @@ const wss = new WebSocket.Server({ server });
 const corsOptions = {
   origin: process.env.NODE_ENV === 'production' 
     ? ['https://frontend-plum-eta-85.vercel.app'] // Your actual Vercel frontend URL
-    : ['http://localhost:3002', 'http://127.0.0.1:3002'],
+    : true, // Allow all origins in development (including macOS app)
   credentials: true,
   optionsSuccessStatus: 200
 };
@@ -118,12 +118,141 @@ interface Comment {
   code_context?: CodeContext | null;
 }
 
+// Timeline interfaces
+interface PRTimelineStage {
+  stage: 'pr_raised' | 'first_review' | 'comments_fixed' | 'approved' | 'merged';
+  timestamp: string;
+  duration_from_previous?: number; // in hours
+}
+
+interface PRTimeline {
+  pr_number: number;
+  pr_title: string;
+  pr_author: string;
+  total_duration: number; // total time from raise to merge in hours
+  stages: PRTimelineStage[];
+  is_completed: boolean; // whether PR reached merged stage
+  stage_durations: {
+    pr_raised_to_first_review: number;
+    first_review_to_comments_fixed: number;
+    comments_fixed_to_approved: number;
+    approved_to_merged: number;
+    total_review_time: number;
+  };
+}
+
 // In-memory storage (replace with database in production)
 let pullRequests: PullRequest[] = [];
 let reviews: Review[] = [];
 let comments: Comment[] = [];
 let prSummaries: Map<number, PRSummary> = new Map(); // Store AI summaries by PR number
 let commonLearning: CommonLearning | null = null; // Store common learning insights
+
+// Comment categorization cache
+interface CachedCommentCategorization {
+  data: CommentCategorizationResponse;
+  generated_at: string;
+  expires_at: string;
+  version: string; // Based on data hash to detect changes
+}
+let commentCategorizationCache: CachedCommentCategorization | null = null;
+
+// Cache management constants
+const CACHE_EXPIRY_HOURS = 2; // Cache expires after 2 hours
+const CACHE_VERSION_PREFIX = 'v1_';
+
+// Helper function to generate data version hash
+function generateDataVersionHash(): string {
+  const dataString = JSON.stringify({
+    prCount: pullRequests.length,
+    commentCount: comments.length,
+    lastUpdated: pullRequests.map(pr => pr.updated_at).sort().slice(-1)[0] || '',
+    humanCommentCount: comments.filter(isHumanComment).length
+  });
+  
+  // Simple hash function for cache versioning
+  let hash = 0;
+  for (let i = 0; i < dataString.length; i++) {
+    const char = dataString.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return CACHE_VERSION_PREFIX + Math.abs(hash).toString(36);
+}
+
+// Helper function to check if cache is valid
+function isCacheValid(cache: CachedCommentCategorization | null): boolean {
+  if (!cache) {
+    return false;
+  }
+  
+  const now = new Date();
+  const expiryTime = new Date(cache.expires_at);
+  const currentVersion = generateDataVersionHash();
+  
+  const isNotExpired = now < expiryTime;
+  const isVersionValid = cache.version === currentVersion;
+  
+  console.log(`🔍 Cache validation:`);
+  console.log(`   ⏰ Not expired: ${isNotExpired} (expires: ${cache.expires_at})`);
+  console.log(`   🏷️  Version valid: ${isVersionValid} (cache: ${cache.version}, current: ${currentVersion})`);
+  
+  return isNotExpired && isVersionValid;
+}
+
+// Helper function to create cache entry
+function createCacheEntry(data: CommentCategorizationResponse): CachedCommentCategorization {
+  const now = new Date();
+  const expiryTime = new Date(now.getTime() + (CACHE_EXPIRY_HOURS * 60 * 60 * 1000));
+  
+  return {
+    data,
+    generated_at: now.toISOString(),
+    expires_at: expiryTime.toISOString(),
+    version: generateDataVersionHash()
+  };
+}
+
+// Background categorization generation
+async function generateBackgroundCategorization() {
+  try {
+    console.log('🔄 Starting background comment categorization...');
+    
+    // Check if there's enough data to analyze
+    if (pullRequests.length === 0) {
+      console.log('⏭️ Skipping background categorization - no PR data available');
+      return;
+    }
+
+    // Filter out bot comments for better analysis
+    const humanComments = comments.filter(isHumanComment);
+    
+    if (humanComments.length === 0) {
+      console.log('⏭️ Skipping background categorization - no human comments available');
+      return;
+    }
+
+    console.log(`🤖 Background categorizing ${humanComments.length} human comments from ${pullRequests.length} PRs...`);
+
+    // Generate comment categorization using Gemini
+    const categorization = await geminiService.categorizeComments(pullRequests, humanComments);
+    
+    // Create and store cache entry
+    commentCategorizationCache = createCacheEntry(categorization);
+    
+    // Broadcast update to connected clients
+    broadcastUpdate({ 
+      type: 'categorization_generated', 
+      data: categorization 
+    });
+    
+    console.log(`✅ Background comment categorization completed successfully`);
+    console.log(`📈 Cached results: ${categorization.overall_summary.total_comments_categorized} comments categorized`);
+
+  } catch (error) {
+    console.error('❌ Error in background comment categorization:', error);
+  }
+}
 
 // Helper function to check if PR is connector integration
 function isConnectorIntegrationPR(pr: any): boolean {
@@ -315,6 +444,124 @@ function countApprovals(prNumber: number): number {
   }
   
   return approvedReviews.length;
+}
+
+// Helper function to calculate days difference between two dates
+function calculateDaysDiff(startDate: string, endDate: string): number {
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  return Math.round((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24) * 10) / 10; // Round to 1 decimal place
+}
+
+// Helper function to calculate PR timeline
+function calculatePRTimeline(pr: PullRequest, prReviews: Review[], prComments: Comment[]): PRTimeline {
+  const stages: PRTimelineStage[] = [];
+  const stageDurations = {
+    pr_raised_to_first_review: 0,
+    first_review_to_comments_fixed: 0,
+    comments_fixed_to_approved: 0,
+    approved_to_merged: 0,
+    total_review_time: 0
+  };
+
+  // Stage 1: PR Raised
+  const prRaisedTime = pr.created_at;
+  stages.push({
+    stage: 'pr_raised',
+    timestamp: prRaisedTime
+  });
+
+  // Stage 2: First Review Done
+  const sortedReviews = prReviews.sort((a, b) => new Date(a.submitted_at).getTime() - new Date(b.submitted_at).getTime());
+  const firstReview = sortedReviews[0];
+  
+  if (firstReview) {
+    const duration = calculateDaysDiff(prRaisedTime, firstReview.submitted_at);
+    stageDurations.pr_raised_to_first_review = duration;
+    
+    stages.push({
+      stage: 'first_review',
+      timestamp: firstReview.submitted_at,
+      duration_from_previous: duration
+    });
+  }
+
+  // Stage 3: Comments Fixed (after changes were requested)
+  const changesRequestedReviews = prReviews.filter(r => r.review_state === 'changes_requested');
+  let commentsFixedTime: string | null = null;
+  
+  if (changesRequestedReviews.length > 0) {
+    // Find the last time changes were requested
+    const lastChangesRequested = changesRequestedReviews.sort((a, b) => 
+      new Date(b.submitted_at).getTime() - new Date(a.submitted_at).getTime()
+    )[0];
+    
+    // Look for subsequent updates after changes were requested
+    const updatesAfterChanges = [pr.updated_at].filter(updateTime => 
+      new Date(updateTime) > new Date(lastChangesRequested.submitted_at)
+    );
+    
+    if (updatesAfterChanges.length > 0) {
+      commentsFixedTime = updatesAfterChanges[0];
+      const duration = firstReview ? calculateDaysDiff(firstReview.submitted_at, commentsFixedTime) : 0;
+      stageDurations.first_review_to_comments_fixed = duration;
+      
+      stages.push({
+        stage: 'comments_fixed',
+        timestamp: commentsFixedTime,
+        duration_from_previous: duration
+      });
+    }
+  }
+
+  // Stage 4: Approved (when PR reached required approvals)
+  const approvedReviews = prReviews.filter(r => r.review_state === 'approved');
+  if (approvedReviews.length >= 1) { // Assuming 1 approval needed, adjust as needed
+    const lastApproval = approvedReviews.sort((a, b) => 
+      new Date(b.submitted_at).getTime() - new Date(a.submitted_at).getTime()
+    )[0];
+    
+    const baseTime = commentsFixedTime || (firstReview ? firstReview.submitted_at : prRaisedTime);
+    const duration = calculateDaysDiff(baseTime, lastApproval.submitted_at);
+    stageDurations.comments_fixed_to_approved = duration;
+    
+    stages.push({
+      stage: 'approved',
+      timestamp: lastApproval.submitted_at,
+      duration_from_previous: duration
+    });
+  }
+
+  // Stage 5: Merged
+  if (pr.merged_at) {
+    const approvedTime = stages.find(s => s.stage === 'approved')?.timestamp;
+    const baseTime = approvedTime || (commentsFixedTime || (firstReview ? firstReview.submitted_at : prRaisedTime));
+    const duration = calculateDaysDiff(baseTime, pr.merged_at);
+    stageDurations.approved_to_merged = duration;
+    
+    stages.push({
+      stage: 'merged',
+      timestamp: pr.merged_at,
+      duration_from_previous: duration
+    });
+  }
+
+  // Calculate total duration
+  const totalDuration = pr.merged_at ? 
+    calculateDaysDiff(prRaisedTime, pr.merged_at) : 
+    calculateDaysDiff(prRaisedTime, new Date().toISOString());
+
+  stageDurations.total_review_time = totalDuration;
+
+  return {
+    pr_number: pr.github_pr_number,
+    pr_title: pr.title,
+    pr_author: pr.author,
+    total_duration: totalDuration,
+    stages,
+    is_completed: pr.status === 'merged' || pr.status === 'closed',
+    stage_durations: stageDurations
+  };
 }
 
 // Helper function to get pending reviewers
@@ -698,11 +945,18 @@ async function fetchConnectorPRs() {
     console.log(`✨ Successfully processed ${pullRequests.length} connector integration PRs`);
     broadcastUpdate({ type: 'prs_updated', data: pullRequests });
     
-    // Trigger background summary generation after PR data is updated
+    // Trigger background summary and categorization generation after PR data is updated
     setTimeout(() => {
       generateBackgroundSummaries().catch(error => {
         console.error('❌ Error in background summary generation:', error);
       });
+      
+      // Also trigger background categorization if cache is invalid or doesn't exist
+      if (!isCacheValid(commentCategorizationCache)) {
+        generateBackgroundCategorization().catch(error => {
+          console.error('❌ Error in background categorization generation:', error);
+        });
+      }
     }, 2000); // Small delay to ensure all data is processed
     
   } catch (error) {
@@ -892,6 +1146,64 @@ app.get('/api/analytics', (req, res) => {
   };
   
   res.json(analytics);
+});
+
+// Timeline Analytics Endpoint
+app.get('/api/analytics/timeline', (req, res) => {
+  try {
+    console.log('📊 Generating timeline analytics for all PRs...');
+    
+    // Calculate timeline for each PR
+    const timelineData: PRTimeline[] = pullRequests.map(pr => {
+      const prReviews = reviews.filter(r => r.pr_id === pr.github_pr_number);
+      const prComments = comments.filter(c => c.pr_id === pr.github_pr_number);
+      
+      return calculatePRTimeline(pr, prReviews, prComments);
+    });
+
+    // Sort by total duration for better visualization
+    const sortedTimelineData = timelineData.sort((a, b) => b.total_duration - a.total_duration);
+
+    // Calculate summary statistics
+    const completedPRs = timelineData.filter(t => t.is_completed);
+    const avgTotalTime = completedPRs.length > 0 
+      ? completedPRs.reduce((sum, t) => sum + t.total_duration, 0) / completedPRs.length 
+      : 0;
+
+    const avgFirstReviewTime = timelineData
+      .filter(t => t.stage_durations.pr_raised_to_first_review > 0)
+      .reduce((sum, t, _, arr) => sum + t.stage_durations.pr_raised_to_first_review / arr.length, 0);
+
+    const avgApprovalTime = completedPRs
+      .filter(t => t.stage_durations.comments_fixed_to_approved > 0)
+      .reduce((sum, t, _, arr) => sum + t.stage_durations.comments_fixed_to_approved / arr.length, 0);
+
+    const summary = {
+      total_prs_analyzed: timelineData.length,
+      completed_prs: completedPRs.length,
+      avg_total_time_days: Math.round(avgTotalTime * 10) / 10,
+      avg_first_review_time_days: Math.round(avgFirstReviewTime * 10) / 10,
+      avg_approval_time_days: Math.round(avgApprovalTime * 10) / 10,
+      longest_pr: sortedTimelineData[0] || null,
+      fastest_pr: completedPRs.sort((a, b) => a.total_duration - b.total_duration)[0] || null
+    };
+
+    console.log(`✅ Generated timeline for ${timelineData.length} PRs`);
+    console.log(`📈 Summary: Avg total time ${summary.avg_total_time_days}d, First review ${summary.avg_first_review_time_days}d`);
+
+    res.json({
+      timeline_data: sortedTimelineData,
+      summary: summary,
+      generated_at: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Error generating timeline analytics:', error);
+    res.status(500).json({ 
+      error: 'Failed to generate timeline analytics',
+      details: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
 });
 
 // Gemini AI Summary Endpoints
@@ -1249,6 +1561,179 @@ app.get('/api/common-learning/trends', (req, res) => {
   }
 });
 
+// Comment Categorization Endpoint with Caching
+app.get('/api/analytics/comment-categorization', async (req, res) => {
+  try {
+    console.log('🔍 Comment categorization requested...');
+    
+    // Check cache first
+    if (isCacheValid(commentCategorizationCache)) {
+      console.log('📋 Returning cached comment categorization data');
+      const cacheAge = Math.round((new Date().getTime() - new Date(commentCategorizationCache!.generated_at).getTime()) / (1000 * 60));
+      res.setHeader('X-Cache-Status', 'HIT');
+      res.setHeader('X-Cache-Age', `${cacheAge}m`);
+      res.setHeader('X-Data-Version', commentCategorizationCache!.version);
+      return res.json({
+        ...commentCategorizationCache!.data,
+        cache_info: {
+          from_cache: true,
+          generated_at: commentCategorizationCache!.generated_at,
+          expires_at: commentCategorizationCache!.expires_at,
+          cache_age_minutes: cacheAge
+        }
+      });
+    }
+
+    console.log('🔄 Cache miss or invalid - generating fresh categorization...');
+    console.log(`📊 Analyzing ${pullRequests.length} PRs with ${comments.length} total comments`);
+
+    // Check if there's enough data to analyze
+    if (pullRequests.length === 0) {
+      return res.status(400).json({ 
+        error: 'No PR data available for analysis',
+        message: 'Please wait for PR data to be loaded first.'
+      });
+    }
+
+    // Filter out bot comments for better analysis
+    const humanComments = comments.filter(isHumanComment);
+    const botComments = comments.filter(c => !isHumanComment(c));
+
+    console.log(`🤖 Comment filtering results:`);
+    console.log(`   👥 Human comments: ${humanComments.length}`);
+    console.log(`   🤖 Bot comments: ${botComments.length} (filtered out)`);
+
+    if (humanComments.length === 0) {
+      return res.status(400).json({ 
+        error: 'No human comments available for categorization',
+        message: 'All comments appear to be automated. No meaningful categorization possible.',
+        statistics: {
+          total_comments: comments.length,
+          human_comments: humanComments.length,
+          bot_comments: botComments.length
+        }
+      });
+    }
+
+    // Generate comment categorization using Gemini
+    const categorization = await geminiService.categorizeComments(pullRequests, humanComments);
+    
+    // Create and store cache entry
+    commentCategorizationCache = createCacheEntry(categorization);
+    
+    // Broadcast update to connected clients
+    broadcastUpdate({ 
+      type: 'categorization_generated', 
+      data: categorization 
+    });
+    
+    console.log(`✅ Comment categorization completed and cached successfully`);
+    console.log(`📈 Results: ${categorization.overall_summary.total_comments_categorized} comments categorized across ${categorization.overall_summary.total_prs_analyzed} PRs`);
+
+    res.setHeader('X-Cache-Status', 'MISS');
+    res.setHeader('X-Data-Version', commentCategorizationCache.version);
+    res.json({
+      ...categorization,
+      cache_info: {
+        from_cache: false,
+        generated_at: commentCategorizationCache.generated_at,
+        expires_at: commentCategorizationCache.expires_at,
+        cache_age_minutes: 0
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error generating comment categorization:', error);
+    res.status(500).json({ 
+      error: 'Failed to generate comment categorization',
+      details: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// Cache management endpoints
+app.get('/api/analytics/comment-categorization/cache/status', (req, res) => {
+  if (commentCategorizationCache) {
+    const now = new Date();
+    const generated = new Date(commentCategorizationCache.generated_at);
+    const expires = new Date(commentCategorizationCache.expires_at);
+    const ageMinutes = Math.round((now.getTime() - generated.getTime()) / (1000 * 60));
+    const expiresInMinutes = Math.round((expires.getTime() - now.getTime()) / (1000 * 60));
+    const isValid = isCacheValid(commentCategorizationCache);
+    
+    res.json({
+      cached: true,
+      valid: isValid,
+      generated_at: commentCategorizationCache.generated_at,
+      expires_at: commentCategorizationCache.expires_at,
+      version: commentCategorizationCache.version,
+      age_minutes: ageMinutes,
+      expires_in_minutes: Math.max(0, expiresInMinutes),
+      data_summary: {
+        total_prs: commentCategorizationCache.data.overall_summary.total_prs_analyzed,
+        total_comments: commentCategorizationCache.data.overall_summary.total_comments_categorized,
+        avg_confidence: commentCategorizationCache.data.overall_summary.avg_confidence_score
+      }
+    });
+  } else {
+    res.json({
+      cached: false,
+      valid: false,
+      message: 'No cached data available'
+    });
+  }
+});
+
+app.post('/api/analytics/comment-categorization/cache/refresh', async (req, res) => {
+  try {
+    console.log('🔄 Manual cache refresh requested...');
+    
+    // Clear existing cache
+    commentCategorizationCache = null;
+    
+    // Trigger background generation
+    generateBackgroundCategorization().then(() => {
+      broadcastUpdate({ 
+        type: 'categorization_refresh_completed',
+        data: { status: 'completed' }
+      });
+    }).catch(error => {
+      console.error('❌ Error in manual cache refresh:', error);
+      broadcastUpdate({ 
+        type: 'categorization_refresh_failed',
+        data: { error: error.message }
+      });
+    });
+    
+    res.json({
+      status: 'refresh_initiated',
+      message: 'Cache refresh started in background. New data will be available shortly.'
+    });
+    
+  } catch (error) {
+    console.error('❌ Error initiating cache refresh:', error);
+    res.status(500).json({ 
+      error: 'Failed to initiate cache refresh',
+      details: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+app.delete('/api/analytics/comment-categorization/cache', (req, res) => {
+  console.log('🗑️ Clearing comment categorization cache...');
+  commentCategorizationCache = null;
+  
+  broadcastUpdate({ 
+    type: 'categorization_cache_cleared',
+    data: { timestamp: new Date().toISOString() }
+  });
+  
+  res.json({
+    status: 'cache_cleared',
+    message: 'Comment categorization cache has been cleared.'
+  });
+});
+
 // Test Gemini connection endpoint
 app.get('/api/gemini/test', async (req, res) => {
   try {
@@ -1470,6 +1955,10 @@ async function initialize() {
 }
 
 const PORT = process.env.PORT || 3001;
+
+console.log(`🚀 Starting server on port ${PORT}`);
+console.log(`📡 CORS enabled for development - allowing all origins`);
+console.log(`🔗 API will be available at: http://localhost:${PORT}`);
 
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);

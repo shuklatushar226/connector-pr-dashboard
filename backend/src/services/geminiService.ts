@@ -149,6 +149,62 @@ export interface CommonLearning {
   };
 }
 
+// Comment Categorization interfaces
+export interface CategorizedComment {
+  comment_id: number;
+  content: string;
+  author: string;
+  created_at: string;
+  file_path?: string;
+  line_number?: number;
+  category: 'reusability' | 'rust_best_practices' | 'status_mapping' | 'typos' | 'unclassified';
+  confidence_score: number;
+  reasoning: string;
+}
+
+export interface PRCommentCategorization {
+  pr_number: number;
+  pr_title: string;
+  pr_author: string;
+  categories: {
+    reusability: CategorizedComment[];
+    rust_best_practices: CategorizedComment[];
+    status_mapping: CategorizedComment[];
+    typos: CategorizedComment[];
+    unclassified: CategorizedComment[];
+  };
+  summary: {
+    total_comments: number;
+    reusability_count: number;
+    rust_best_practices_count: number;
+    status_mapping_count: number;
+    typos_count: number;
+    unclassified_count: number;
+    avg_confidence: number;
+  };
+}
+
+export interface CommentCategorizationResponse {
+  pr_categorizations: PRCommentCategorization[];
+  overall_summary: {
+    total_prs_analyzed: number;
+    total_comments_categorized: number;
+    category_distribution: {
+      reusability: number;
+      rust_best_practices: number;
+      status_mapping: number;
+      typos: number;
+      unclassified: number;
+    };
+    avg_confidence_score: number;
+  };
+  metadata: {
+    generated_at: string;
+    model_used: string;
+    analysis_scope: string;
+  };
+}
+
 // Comment and Review interfaces (matching the main app)
 interface CodeContext {
   file_path: string;
@@ -696,6 +752,364 @@ Important Guidelines:
     else if (recentPRs.length > 5) score += 0.1;
 
     return Math.min(score, 1.0);
+  }
+
+  /**
+   * Categorize comments from multiple PRs into specific categories
+   */
+  async categorizeComments(
+    allPRs: PullRequest[],
+    allComments: Comment[]
+  ): Promise<CommentCategorizationResponse> {
+    try {
+      console.log(`🔍 Starting comment categorization for ${allPRs.length} PRs with ${allComments.length} total comments`);
+      
+      const prCategorizations: PRCommentCategorization[] = [];
+      
+      // Process each PR individually to avoid overwhelming the AI
+      for (const pr of allPRs) {
+        const prComments = allComments.filter(c => c.pr_id === pr.github_pr_number);
+        
+        if (prComments.length === 0) {
+          // Create empty categorization for PRs with no comments
+          prCategorizations.push({
+            pr_number: pr.github_pr_number,
+            pr_title: pr.title,
+            pr_author: pr.author,
+            categories: {
+              reusability: [],
+              rust_best_practices: [],
+              status_mapping: [],
+              typos: [],
+              unclassified: []
+            },
+            summary: {
+              total_comments: 0,
+              reusability_count: 0,
+              rust_best_practices_count: 0,
+              status_mapping_count: 0,
+              typos_count: 0,
+              unclassified_count: 0,
+              avg_confidence: 0
+            }
+          });
+          continue;
+        }
+
+        console.log(`📝 Categorizing ${prComments.length} comments for PR #${pr.github_pr_number}: "${pr.title}"`);
+        
+        const prompt = this.buildCategorizationPrompt(pr, prComments);
+        const result = await this.model.generateContent(prompt);
+        const response = await result.response;
+        let text = response.text();
+
+        // Clean up response
+        text = text.trim();
+        if (text.startsWith('```json')) {
+          text = text.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+        } else if (text.startsWith('```')) {
+          text = text.replace(/^```\s*/, '').replace(/\s*```$/, '');
+        }
+
+        // Parse response
+        let categorizationData;
+        try {
+          categorizationData = JSON.parse(text);
+        } catch (parseError) {
+          console.error(`❌ Failed to parse categorization response for PR #${pr.github_pr_number}:`, text);
+          // Create fallback categorization
+          const fallbackCategorization = this.createFallbackCategorization(pr, prComments);
+          prCategorizations.push(fallbackCategorization);
+          continue;
+        }
+
+        // Validate and process the categorization
+        const prCategorization = this.processCategorization(pr, categorizationData, prComments);
+        prCategorizations.push(prCategorization);
+        
+        console.log(`✅ Categorized PR #${pr.github_pr_number}: ${prCategorization.summary.total_comments} comments processed`);
+        
+        // Small delay to avoid overwhelming the API
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+
+      // Calculate overall summary
+      const overallSummary = this.calculateOverallSummary(prCategorizations);
+
+      const response: CommentCategorizationResponse = {
+        pr_categorizations: prCategorizations,
+        overall_summary: overallSummary,
+        metadata: {
+          generated_at: new Date().toISOString(),
+          model_used: process.env.GEMINI_MODEL || 'gemini-2.0-flash-exp',
+          analysis_scope: `${allPRs.length} PRs with ${allComments.length} comments`
+        }
+      };
+
+      console.log(`🎉 Comment categorization completed: ${overallSummary.total_comments_categorized} comments categorized across ${overallSummary.total_prs_analyzed} PRs`);
+      
+      return response;
+
+    } catch (error) {
+      console.error('❌ Error in comment categorization:', error);
+      throw new Error(`Failed to categorize comments: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Build prompt for comment categorization
+   */
+  private buildCategorizationPrompt(pr: PullRequest, comments: Comment[]): string {
+    const commentsText = comments.map((comment, index) => {
+      let context = '';
+      if (comment.file_path) {
+        context = ` (${comment.file_path}${comment.line_number ? `:${comment.line_number}` : ''})`;
+      }
+      
+      return `
+Comment ${index + 1}:
+- ID: ${comment.id}
+- Author: ${comment.author}
+- Created: ${comment.created_at}
+- Type: ${comment.comment_type}${context}
+- Content: "${comment.content}"
+---`;
+    }).join('\n');
+
+    return `
+You are an expert AI system specializing in analyzing software development comments from GitHub Pull Requests. Your task is to categorize each comment into one of 5 specific categories with high accuracy.
+
+## PR Context:
+- **PR #${pr.github_pr_number}**: ${pr.title}
+- **Author**: ${pr.author}
+- **Status**: ${pr.status}
+- **Total Comments**: ${comments.length}
+
+## Comments to Categorize:
+${commentsText}
+
+## Categorization Rules:
+
+**1. REUSABILITY**: Comments about code reuse, modularity, DRY principles, extracting common functionality, shared utilities, avoiding duplication
+Examples: "This logic could be extracted into a utility function", "Consider making this reusable", "We have similar code elsewhere"
+
+**2. RUST_BEST_PRACTICES**: Comments about Rust-specific coding standards, idioms, performance patterns, memory safety, error handling, type usage
+Examples: "Use Option<T> instead of null checks", "Consider using Result<T, E>", "This could be more idiomatic Rust", "Memory safety concern"
+
+**3. STATUS_MAPPING**: Comments about HTTP status codes, error codes, API response handling, status enums, error mapping
+Examples: "Wrong status code", "Should return 404 here", "Error mapping is incorrect", "Status response handling"
+
+**4. TYPOS**: Comments about spelling mistakes, grammar errors, documentation fixes, variable naming
+Examples: "Typo in comment", "Fix spelling", "Variable name is misspelled", "Documentation error"
+
+**5. UNCLASSIFIED**: Comments that don't clearly fit into the above categories (general questions, architectural discussions, etc.)
+
+## Instructions:
+Analyze each comment carefully and categorize it. Provide a confidence score (0.0-1.0) and brief reasoning for each categorization.
+
+Return ONLY a valid JSON object with this exact structure:
+
+{
+  "categorized_comments": [
+    {
+      "comment_id": 123,
+      "category": "reusability|rust_best_practices|status_mapping|typos|unclassified",
+      "confidence_score": 0.85,
+      "reasoning": "Brief explanation of why this comment fits this category"
+    }
+  ]
+}
+
+Important Guidelines:
+- Be conservative with categorization - when in doubt, use "unclassified"
+- Focus on the main intent/topic of each comment
+- Consider the technical context and domain (HyperSwitch connector integrations)
+- Provide specific, actionable reasoning for each categorization
+- Confidence scores should reflect how certain you are about the categorization
+- Return only valid JSON, no additional text or formatting
+`;
+  }
+
+  /**
+   * Process and validate categorization data from Gemini
+   */
+  private processCategorization(
+    pr: PullRequest,
+    categorizationData: any,
+    originalComments: Comment[]
+  ): PRCommentCategorization {
+    const categories = {
+      reusability: [] as CategorizedComment[],
+      rust_best_practices: [] as CategorizedComment[],
+      status_mapping: [] as CategorizedComment[],
+      typos: [] as CategorizedComment[],
+      unclassified: [] as CategorizedComment[]
+    };
+
+    const categorizedComments = categorizationData.categorized_comments || [];
+    
+    // Process each categorized comment
+    for (const catComment of categorizedComments) {
+      const originalComment = originalComments.find(c => c.id === catComment.comment_id);
+      if (!originalComment) continue;
+
+      const categorizedComment: CategorizedComment = {
+        comment_id: originalComment.id,
+        content: originalComment.content,
+        author: originalComment.author,
+        created_at: originalComment.created_at,
+        file_path: originalComment.file_path || undefined,
+        line_number: originalComment.line_number || undefined,
+        category: catComment.category || 'unclassified',
+        confidence_score: Math.min(Math.max(catComment.confidence_score || 0.5, 0), 1),
+        reasoning: catComment.reasoning || 'No reasoning provided'
+      };
+
+      // Ensure valid category
+      if (categories.hasOwnProperty(categorizedComment.category)) {
+        categories[categorizedComment.category as keyof typeof categories].push(categorizedComment);
+      } else {
+        categories.unclassified.push({
+          ...categorizedComment,
+          category: 'unclassified'
+        });
+      }
+    }
+
+    // Calculate summary
+    const totalComments = Object.values(categories).reduce((sum, arr) => sum + arr.length, 0);
+    const avgConfidence = totalComments > 0 
+      ? Object.values(categories).flat().reduce((sum, comment) => sum + comment.confidence_score, 0) / totalComments
+      : 0;
+
+    return {
+      pr_number: pr.github_pr_number,
+      pr_title: pr.title,
+      pr_author: pr.author,
+      categories,
+      summary: {
+        total_comments: totalComments,
+        reusability_count: categories.reusability.length,
+        rust_best_practices_count: categories.rust_best_practices.length,
+        status_mapping_count: categories.status_mapping.length,
+        typos_count: categories.typos.length,
+        unclassified_count: categories.unclassified.length,
+        avg_confidence: Math.round(avgConfidence * 100) / 100
+      }
+    };
+  }
+
+  /**
+   * Create fallback categorization when AI fails
+   */
+  private createFallbackCategorization(pr: PullRequest, comments: Comment[]): PRCommentCategorization {
+    console.log(`⚠️ Creating fallback categorization for PR #${pr.github_pr_number}`);
+    
+    // Simple keyword-based fallback categorization
+    const categories = {
+      reusability: [] as CategorizedComment[],
+      rust_best_practices: [] as CategorizedComment[],
+      status_mapping: [] as CategorizedComment[],
+      typos: [] as CategorizedComment[],
+      unclassified: [] as CategorizedComment[]
+    };
+
+    for (const comment of comments) {
+      const content = comment.content.toLowerCase();
+      let category: CategorizedComment['category'] = 'unclassified';
+      let confidence = 0.3; // Low confidence for fallback
+
+      // Simple keyword matching
+      if (content.includes('reuse') || content.includes('duplicate') || content.includes('extract') || content.includes('utility')) {
+        category = 'reusability';
+        confidence = 0.4;
+      } else if (content.includes('rust') || content.includes('option') || content.includes('result') || content.includes('idiomatic')) {
+        category = 'rust_best_practices';
+        confidence = 0.4;
+      } else if (content.includes('status') || content.includes('error code') || content.includes('404') || content.includes('response')) {
+        category = 'status_mapping';
+        confidence = 0.4;
+      } else if (content.includes('typo') || content.includes('spelling') || content.includes('grammar') || content.includes('misspell')) {
+        category = 'typos';
+        confidence = 0.5;
+      }
+
+      const categorizedComment: CategorizedComment = {
+        comment_id: comment.id,
+        content: comment.content,
+        author: comment.author,
+        created_at: comment.created_at,
+        file_path: comment.file_path || undefined,
+        line_number: comment.line_number || undefined,
+        category,
+        confidence_score: confidence,
+        reasoning: 'Fallback categorization using keyword matching'
+      };
+
+      categories[category].push(categorizedComment);
+    }
+
+    const totalComments = comments.length;
+    const avgConfidence = 0.35; // Fixed low confidence for fallback
+
+    return {
+      pr_number: pr.github_pr_number,
+      pr_title: pr.title,
+      pr_author: pr.author,
+      categories,
+      summary: {
+        total_comments: totalComments,
+        reusability_count: categories.reusability.length,
+        rust_best_practices_count: categories.rust_best_practices.length,
+        status_mapping_count: categories.status_mapping.length,
+        typos_count: categories.typos.length,
+        unclassified_count: categories.unclassified.length,
+        avg_confidence: avgConfidence
+      }
+    };
+  }
+
+  /**
+   * Calculate overall summary statistics
+   */
+  private calculateOverallSummary(prCategorizations: PRCommentCategorization[]) {
+    const categoryDistribution = {
+      reusability: 0,
+      rust_best_practices: 0,
+      status_mapping: 0,
+      typos: 0,
+      unclassified: 0
+    };
+
+    let totalComments = 0;
+    let totalConfidence = 0;
+    let totalConfidenceCount = 0;
+
+    for (const prCat of prCategorizations) {
+      totalComments += prCat.summary.total_comments;
+      
+      // Count categories
+      categoryDistribution.reusability += prCat.summary.reusability_count;
+      categoryDistribution.rust_best_practices += prCat.summary.rust_best_practices_count;
+      categoryDistribution.status_mapping += prCat.summary.status_mapping_count;
+      categoryDistribution.typos += prCat.summary.typos_count;
+      categoryDistribution.unclassified += prCat.summary.unclassified_count;
+
+      // Calculate weighted confidence
+      if (prCat.summary.total_comments > 0) {
+        totalConfidence += prCat.summary.avg_confidence * prCat.summary.total_comments;
+        totalConfidenceCount += prCat.summary.total_comments;
+      }
+    }
+
+    return {
+      total_prs_analyzed: prCategorizations.length,
+      total_comments_categorized: totalComments,
+      category_distribution: categoryDistribution,
+      avg_confidence_score: totalConfidenceCount > 0 
+        ? Math.round((totalConfidence / totalConfidenceCount) * 100) / 100
+        : 0
+    };
   }
 
   /**
